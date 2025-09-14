@@ -1,6 +1,6 @@
 from django.shortcuts import render
 from django.conf import settings
-from gemini import initialize_vectorstore, rag_query
+from main import initialize_vectorstore, rag_query
 import os
 
 def chat_view(request):

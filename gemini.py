@@ -1,109 +1,135 @@
 
-import os
-from dotenv import load_dotenv
-import google.generativeai as genai
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PDFPlumberLoader
+import ollama
+from langchain.docstore.document import Document
 
-load_dotenv()
+embed_model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    cache_folder="D:/huggingface_models"
+)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError(
-        " GEMINI_API_KEY not found.\n"
-        "Set it in terminal using:\n"
-        "  PowerShell: $env:GEMINI_API_KEY='your_api_key'\n"
-        "  Command Prompt: set GEMINI_API_KEY=your_api_key\n"
-        "Or put it in a .env file like:\n"
-        "  GEMINI_API_KEY=your_api_key"
-    )
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-vectorstore = None  
-
-def load_file(file_path: str):
-    """
-    Load a PDF, DOCX, or TXT file and return documents.
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    ext = file_path.split(".")[-1].lower()
-
-    if ext == "pdf":
-        from langchain_community.document_loaders import PyPDFLoader
-        loader = PyPDFLoader(file_path)
-    elif ext == "docx":
-        try:
-            from langchain.document_loaders import UnstructuredWordDocumentLoader
-        except ImportError:
-            raise ImportError("Install 'unstructured' and 'python-docx' for DOCX support.")
-        loader = UnstructuredWordDocumentLoader(file_path)
-    elif ext == "txt":
-        from langchain.document_loaders import TextLoader
-        loader = TextLoader(file_path, encoding="utf-8")
-    else:
-        raise ValueError("Unsupported file type. Only PDF, DOCX, TXT are allowed.")
-
-    docs = loader.load()
-    return docs
-
+vectorstore = None
+current_file_path = None
 
 def initialize_vectorstore(file_path: str):
-    """
-    Load document, split into chunks, create embeddings, and initialize vectorstore.
-    """
-    global vectorstore
-    docs = load_file(file_path)
+    global vectorstore, current_file_path
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = text_splitter.split_documents(docs)
+    if vectorstore is not None and current_file_path == file_path:
+        print("Using existing vectorstore")
+        return
 
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=GEMINI_API_KEY
+    print(f"Initializing vectorstore for: {file_path}")
+    current_file_path = file_path
+
+    loader = PDFPlumberLoader(file_path)
+    docs = loader.load()
+
+    if not docs or all(not doc.page_content.strip() for doc in docs):
+        print("Warning: PDF appears empty or unreadable")
+        return
+    
+    for i, doc in enumerate(docs):
+        page_text = doc.page_content.strip()
+        print(f"--- Page {i} ---")
+        print(f"Length: {len(page_text)} characters")
+        print(f"Start of page:\n{page_text[:500]}")  
+        print(f"End of page:\n{page_text[-500:]}\n")  
+        print("-"*80)
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, 
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". "]
     )
+    chunks = []
+    for i, doc in enumerate(docs):
+        page_chunks = text_splitter.split_text(doc.page_content)
+        for j, chunk_text in enumerate(page_chunks):
+            chunk_doc = Document(page_content=chunk_text, metadata={"page": i+1, "chunk": j+1})
+            chunks.append(chunk_doc)
 
-    vectorstore = Chroma.from_documents(chunks, embeddings)
+    print(f"Created {len(chunks)} chunks from {len(docs)} pages")
+    for i, chunk in enumerate(chunks):
+        print(f"\n--- Chunk {i} (Page {chunk.metadata['page']}, Chunk {chunk.metadata['chunk']}) ---")
+        print(f"Length: {len(chunk.page_content)} characters")
+        print(f"Content:\n{chunk.page_content}")
+        print("-"*80)
 
+    class LocalEmbedding:
+        def embed_documents(self, texts):
+            return embed_model.encode(texts, show_progress_bar=False, convert_to_tensor=False).tolist()
+        def embed_query(self, text):
+            return embed_model.encode([text], convert_to_tensor=False).tolist()[0]
+
+    embedding_wrapper = LocalEmbedding()
+
+    try:
+        vectorstore = Chroma.from_documents(chunks, embedding_wrapper)
+        print("Vectorstore initialized successfully!")
+    except Exception as e:
+        print(f"Error creating vectorstore: {e}")
 
 def rag_query(question: str) -> str:
     if vectorstore is None:
-        raise ValueError("Vectorstore not initialized. Call initialize_vectorstore(file_path) first.")
+        return "Error: Vectorstore not initialized. Please run initialize_vectorstore() first."
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    retrieved_docs = retriever.get_relevant_documents(question)
-    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    print(f"Processing question: {question}")
 
-    prompt = f"""
-    Answer the question based on the context below.
+    try:
+        retrieved_docs = vectorstore.similarity_search(question, k=5)
 
-    Context:
-    {context}
+        if not retrieved_docs:
+            return "No relevant documents found."
 
-    Question:
-    {question}
+        for i, doc in enumerate(retrieved_docs[:3]):
+            print(f"Top Chunk {i+1} ({len(doc.page_content)} chars):\n{doc.page_content[:300]}...\n{'-'*40}\n")
 
-    Answer:
-    """
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text.strip()
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
 
+        # Prepare prompt
+        prompt = f"""You are an information extraction assistant. 
+Extract the answer to the question using ONLY the information provided below. 
+If the answer is a percentage, number, or date, copy it exactly as written. 
+If the answer is not present, say 'Not found in the context.'
+Information:
+{context}
 
+Question: {question}
+
+Answer:"""
+
+        print("Querying Ollama...")
+        response = ollama.chat(
+            model="llama3.2",
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "num_predict": 400,
+                "repeat_penalty": 1.1
+            }
+        )
+
+        answer = response['message']['content'].strip()
+        print(f"Generated answer ({len(answer)} chars): {answer[:200]}...")
+        return answer
+
+    except Exception as e:
+        error_msg = f"Error during query: {str(e)}"
+        print(error_msg)
+        return error_msg
 if __name__ == "__main__":
-    file_path = input("Enter the path of your document (PDF, DOCX, TXT): ").strip()
-    initialize_vectorstore(file_path)
-
-    print("\nGemini RAG bot ready! Type 'exit' to quit.")
-    while True:
-        q = input("\nAsk: ")
-        if q.lower() == "exit":
-            print(" Goodbye!")
-            break
-        answer = rag_query(q)
-        print("\n Answer:", answer)
-
+    print("\n--- Gemini RAG Test ---\n")
+    pdf_path = "C:\\Users\\Dell\\Downloads\\SakshiJadhavResume (1).pdf"
+    try:
+        initialize_vectorstore(pdf_path)
+        print("\nVectorstore ready.\n")
+        question = "What is the SSC; Percentage of Sakshi Jadhav?"
+        answer = rag_query(question)
+        print(f"\nFinal Answer:\n{answer}\n")
+    except Exception as e:
+        print(f"Error in main block: {e}")
 
