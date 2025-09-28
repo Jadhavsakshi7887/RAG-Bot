@@ -1,59 +1,34 @@
-# rag_query.py
-import ollama
+
+from langchain_openai import ChatOpenAI
 import vectorstore_manager
+import os
+
+llm = ChatOpenAI(
+    model="openai/gpt-5",  
+    openai_api_key=os.getenv("OPENROUTER_API_KEY", "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"),
+    openai_api_base="https://openrouter.ai/api/v1",
+    max_tokens=400,
+    temperature=0.3,
+    top_p=0.9
+)
 
 def rag_query(question: str) -> str:
-    """
-    Query the RAG system using the initialized vectorstore.
-    """
     if vectorstore_manager.vectorstore is None:
-        return "Error: Vectorstore not initialized. Please run initialize_vectorstore() first."
+        return "Error: Vectorstore not initialized."
 
     vectorstore = vectorstore_manager.vectorstore
-    print(f"Processing question: {question}")
+    retrieved_docs = vectorstore.similarity_search(question, k=10)
+    if not retrieved_docs:
+        return "No relevant documents found."
+
+    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
 
     try:
-        # Retrieve top 5 chunks
-        retrieved_docs = vectorstore.similarity_search(question, k=5)
-        if not retrieved_docs:
-            return "No relevant documents found."
-
-        # Print top 3 chunks
-        for i, doc in enumerate(retrieved_docs[:3]):
-            print(f"Top Chunk {i+1} ({len(doc.page_content)} chars):\n{doc.page_content[:300]}...\n{'-'*40}\n")
-
-        # Combine chunks as context
-        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
-
-        # Prepare prompt
-        prompt = f"""You are an information extraction assistant. 
-Extract the answer to the question using ONLY the information provided below. 
-If the answer is a percentage, number, or date, copy it exactly as written. 
-If the answer is not present, say 'Not found in the context.'
-Information:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-        print("Querying Ollama...")
-        response = ollama.chat(
-            model="llama3.2",
-            messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "num_predict": 400,
-                "repeat_penalty": 1.1
-            }
-        )
-
-        answer = response['message']['content'].strip()
-        print(f"Generated answer ({len(answer)} chars): {answer[:200]}...")
-        return answer
-
+        response = llm.invoke([
+            {"role": "system", "content": "You are an information extraction assistant. Use ONLY the provided context."
+             " If the answer is not present, say 'Not found in the context.'"},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"}
+        ])
+        return response.content.strip()
     except Exception as e:
-        error_msg = f"Error during query: {str(e)}"
-        print(error_msg)
-        return error_msg
+        return f"Error during query: {str(e)}"

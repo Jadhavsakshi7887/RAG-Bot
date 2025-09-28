@@ -1,7 +1,7 @@
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-#from langchain.document_loaders import PDFPlumberLoader
-from langchain.document_loaders import UnstructuredFileLoader
+from langchain_community.document_loaders import UnstructuredFileLoader
+
 
 from langchain.docstore.document import Document
 from embedding import LocalEmbedding
